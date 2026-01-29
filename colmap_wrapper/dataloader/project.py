@@ -24,7 +24,7 @@ import exiftool
 from colmap_wrapper.dataloader import (Camera, Intrinsics, read_array, read_images_text, read_points3D_text,
                                        read_points3d_binary, read_images_binary, generate_colmap_sparse_pc,
                                        write_images_binary, write_points3D_binary)
-from colmap_wrapper.dataloader.bin import read_cameras_text
+from colmap_wrapper.dataloader.bin import read_cameras_text, read_cameras_binary
 
 
 class LoadElement(Enum):
@@ -88,7 +88,8 @@ class COLMAPProject(PhotogrammetrySoftware):
                  exif_read=False,
                  img_orig: Union[str, Path, None] = None,
                  output_status_function=None,
-                 oriented: bool = False):
+                 oriented: bool = False,
+                 ignore_dense: bool = False):
         """
         This is a simple COLMAP project wrapper to simplify the readout of a COLMAP project.
         THE COLMAP project is assumed to be in the following workspace folder structure as suggested in the COLMAP
@@ -132,6 +133,7 @@ class COLMAPProject(PhotogrammetrySoftware):
 
         self.id = project_index
         self.load_depth = True
+        self.ignore_dense = ignore_dense
         self.output_status_function = output_status_function
         if output_status_function:
             self.output_status_function(
@@ -153,44 +155,56 @@ class COLMAPProject(PhotogrammetrySoftware):
             if self._sparse_base_path.joinpath('0').exists():
                 self._sparse_base_path: Path = self._sparse_base_path.joinpath('0')
 
-            self._dense_base_path = self._project_path.joinpath('dense')
-            if self._dense_base_path.joinpath('0').exists():
-                self._dense_base_path: Path = self._dense_base_path.joinpath('0')
+            if self.ignore_dense:
+                self._dense_base_path: Path = None
+            else:
+                self._dense_base_path = self._project_path.joinpath('dense')
+                if self._dense_base_path.joinpath('0').exists():
+                    self._dense_base_path: Path = self._dense_base_path.joinpath('0')
 
-            if not self._dense_base_path.exists():
-                self._dense_base_path: Path = self._project_path
+                if not self._dense_base_path.exists():
+                    self._dense_base_path: Path = self._project_path
         elif isinstance(project_path, dict):
             self._project_path: Path = project_path['project_path']
-            if not project_path['dense'].exists():
+            self._sparse_base_path: Path = project_path['sparse']
+            if self.ignore_dense or project_path.get('dense') is None:
+                self._dense_base_path: Path = None
+            elif not project_path['dense'].exists():
                 self._dense_base_path: Path = self._project_path
             else:
                 self._dense_base_path: Path = project_path['dense']
-            self._sparse_base_path: Path = project_path['sparse']
         else:
             raise ValueError("{}".format(self._project_path))
 
         # Loads undistorted images
-        self._src_image_path: Path = self._dense_base_path.joinpath('images')
-        if not self._src_image_path.exists():
+        if self._dense_base_path is not None:
+            self._src_image_path: Path = self._dense_base_path.joinpath('images')
+            if not self._src_image_path.exists():
+                self._src_image_path: Path = self._project_path.joinpath('images')
+            self._fused_path: Path = self._dense_base_path.joinpath(dense_pc)
+            self._stereo_path: Path = self._dense_base_path.joinpath('stereo')
+            self._depth_image_path: Path = self._stereo_path.joinpath('depth_maps')
+
+            # Check if depth images are in sub folder
+            if self._depth_image_path.exists() and len(list(self._depth_image_path.glob('*.bin'))) == 0:
+                if len(list(self._depth_image_path.glob('*'))) == 1:
+                    self._depth_image_path = list(self._depth_image_path.glob('*'))[0]
+                elif len(list(self._depth_image_path.glob('*'))) > 1:
+                    print('Warning: Multiple depth folders!')
+                    max_items = 0
+                    for path_i in list(self._depth_image_path.glob('*')):
+                        current_item_len = len(list(path_i.glob('*')))
+                        if current_item_len > max_items:
+                            max_items = current_item_len
+                            self._depth_image_path = path_i
+
+            self._normal_image_path: Path = self._stereo_path.joinpath('normal_maps')
+        else:
             self._src_image_path: Path = self._project_path.joinpath('images')
-        self._fused_path: Path = self._dense_base_path.joinpath(dense_pc)
-        self._stereo_path: Path = self._dense_base_path.joinpath('stereo')
-        self._depth_image_path: Path = self._stereo_path.joinpath('depth_maps')
-
-        # Check if depth images are in sub folder
-        if len(list(self._depth_image_path.glob('*.bin'))) == 0:
-            if len(list(self._depth_image_path.glob('*'))) == 1:
-                self._depth_image_path = list(self._depth_image_path.glob('*'))[0]
-            else:
-                print('Warning: Multiple depth folders!')
-                max_items = 0
-                for path_i in list(self._depth_image_path.glob('*')):
-                    current_item_len = len(list(path_i.glob('*')))
-                    if current_item_len > max_items:
-                        max_items = current_item_len
-                        self._depth_image_path = path_i
-
-        self._normal_image_path: Path = self._stereo_path.joinpath('normal_maps')
+            self._fused_path: Path = None
+            self._stereo_path: Path = None
+            self._depth_image_path: Path = None
+            self._normal_image_path: Path = None
 
         self.__project_ini_path: Path = self._project_path / 'sparse' / str(self.id) / 'project.ini'
 
@@ -252,8 +266,13 @@ class COLMAPProject(PhotogrammetrySoftware):
         futures.append(executor.submit(self.__read_cameras))
         futures.append(executor.submit(self.__read_images))
         futures.append(executor.submit(self.__read_sparse_model))
-        futures.append(executor.submit(self.__read_dense_model))
-        futures.append(executor.submit(self.__read_depth_structure))
+        if not self.ignore_dense:
+            futures.append(executor.submit(self.__read_dense_model))
+            futures.append(executor.submit(self.__read_depth_structure))
+        else:
+            self.dense = None
+            self.depth_path_geometric = []
+            self.depth_path_photometric = []
 
         wait(futures)
         futures.clear()
@@ -407,12 +426,18 @@ class COLMAPProject(PhotogrammetrySoftware):
         if self.output_status_function:
             self.output_status_function(LoadElementStatus(element=LoadElement.CAMERAS, project=self, finished=False))
 
-        if (self._sparse_base_path / ('cameras.txt')).exists():
-            cameras = read_cameras_text(self._sparse_base_path / 'cameras.txt')
+        if (self._sparse_base_path / ('cameras.txt')).exists() or (self._sparse_base_path / ('cameras.bin')).exists():
+            if (self._sparse_base_path / ('cameras.txt')).exists():
+                cameras = read_cameras_text(self._sparse_base_path / 'cameras.txt')
+            elif (self._sparse_base_path / ('cameras.bin')).exists():
+                cameras = read_cameras_binary(self._sparse_base_path / 'cameras.bin')
+            else:
+                raise FileNotFoundError('No cameras.txt or cameras.bin file found in sparse folder')
 
             self.cameras = {}
             for camera_id, camera in cameras.items():
-                if camera.model == 'SIMPLE_RADIAL':
+                model_name = camera.model if isinstance(camera.model, str) else camera.model.name
+                if model_name == 'SIMPLE_RADIAL':
                     params = np.asarray([camera.params[0],  # fx
                                          camera.params[0],  # fy
                                          camera.params[1],  # cx
@@ -420,18 +445,45 @@ class COLMAPProject(PhotogrammetrySoftware):
                                          camera.params[3]])  # k1
                     # cv2.getOptimalNewCameraMatrix(camera.calibration_matrix(), [k, 0, 0, 0], (camera.width, camera.height), )
 
-                elif camera.model == 'PINHOLE':
+                elif model_name == 'PINHOLE':
                     params = np.asarray([camera.params[0],  # fx
                                          camera.params[1],  # fy
                                          camera.params[2],  # cx
                                          camera.params[3],  # cy
                                          0])  # k1
 
+                elif model_name == 'OPENCV':
+                    # OPENCV: fx, fy, cx, cy, k1, k2, p1, p2
+                    params = np.asarray([camera.params[0],  # fx
+                                         camera.params[1],  # fy
+                                         camera.params[2],  # cx
+                                         camera.params[3],  # cy
+                                         camera.params[4] if len(camera.params) > 4 else 0])  # k1
+
+                elif model_name == 'RADIAL':
+                    # RADIAL: f, cx, cy, k1, k2
+                    params = np.asarray([camera.params[0],  # fx
+                                         camera.params[0],  # fy (same as fx)
+                                         camera.params[1],  # cx
+                                         camera.params[2],  # cy
+                                         camera.params[3] if len(camera.params) > 3 else 0])  # k1
+
+                elif model_name == 'SIMPLE_PINHOLE':
+                    # SIMPLE_PINHOLE: f, cx, cy
+                    params = np.asarray([camera.params[0],  # fx
+                                         camera.params[0],  # fy (same as fx)
+                                         camera.params[1],  # cx
+                                         camera.params[2],  # cy
+                                         0])  # k1
+
                 else:
-                    raise NotImplementedError('Model {} is not implemented!'.format(camera.model.name))
+                    warnings.warn('Model {} is not fully implemented, using raw params'.format(model_name))
+                    # Fallback: use params as-is, pad to 5 elements
+                    params = np.zeros(5)
+                    params[:min(len(camera.params), 5)] = camera.params[:min(len(camera.params), 5)]
 
                 camera_params = Camera(id=camera.id,
-                                       model=camera.model,
+                                       model=model_name,
                                        width=camera.width,
                                        height=camera.height,
                                        params=params)
@@ -442,7 +494,8 @@ class COLMAPProject(PhotogrammetrySoftware):
             reconstruction = pycolmap.Reconstruction(self._sparse_base_path)
             self.cameras = {}
             for camera_id, camera in reconstruction.cameras.items():
-                if camera.model.name == 'SIMPLE_RADIAL':
+                model_name = camera.model.name if hasattr(camera.model, 'name') else str(camera.model)
+                if model_name == 'SIMPLE_RADIAL':
                     params = np.asarray([camera.params[0],  # fx
                                          camera.params[0],  # fy
                                          camera.params[1],  # cx
@@ -450,18 +503,45 @@ class COLMAPProject(PhotogrammetrySoftware):
                                          camera.params[3]])  # k1
                     # cv2.getOptimalNewCameraMatrix(camera.calibration_matrix(), [k, 0, 0, 0], (camera.width, camera.height), )
 
-                elif camera.model.name == 'PINHOLE':
+                elif model_name == 'PINHOLE':
                     params = np.asarray([camera.params[0],  # fx
                                          camera.params[1],  # fy
                                          camera.params[2],  # cx
                                          camera.params[3],  # cy
                                          0])  # k1
 
+                elif model_name == 'OPENCV':
+                    # OPENCV: fx, fy, cx, cy, k1, k2, p1, p2
+                    params = np.asarray([camera.params[0],  # fx
+                                         camera.params[1],  # fy
+                                         camera.params[2],  # cx
+                                         camera.params[3],  # cy
+                                         camera.params[4] if len(camera.params) > 4 else 0])  # k1
+
+                elif model_name == 'RADIAL':
+                    # RADIAL: f, cx, cy, k1, k2
+                    params = np.asarray([camera.params[0],  # fx
+                                         camera.params[0],  # fy (same as fx)
+                                         camera.params[1],  # cx
+                                         camera.params[2],  # cy
+                                         camera.params[3] if len(camera.params) > 3 else 0])  # k1
+
+                elif model_name == 'SIMPLE_PINHOLE':
+                    # SIMPLE_PINHOLE: f, cx, cy
+                    params = np.asarray([camera.params[0],  # fx
+                                         camera.params[0],  # fy (same as fx)
+                                         camera.params[1],  # cx
+                                         camera.params[2],  # cy
+                                         0])  # k1
+
                 else:
-                    raise NotImplementedError('Model {} is not implemented!'.format(camera.model.name))
+                    warnings.warn('Model {} is not fully implemented, using raw params'.format(model_name))
+                    # Fallback: use params as-is, pad to 5 elements
+                    params = np.zeros(5)
+                    params[:min(len(camera.params), 5)] = camera.params[:min(len(camera.params), 5)]
 
                 camera_params = Camera(id=camera.camera_id,
-                                       model=camera.model.name,
+                                       model=model_name,
                                        width=camera.width,
                                        height=camera.height,
                                        params=params)
@@ -521,12 +601,15 @@ class COLMAPProject(PhotogrammetrySoftware):
 
         @return:
         """
+        self.depth_path_geometric = []
+        self.depth_path_photometric = []
+
+        if self._depth_image_path is None or not self._depth_image_path.exists():
+            return
+
         if self.output_status_function:
             self.output_status_function(
                 LoadElementStatus(element=LoadElement.DEPTH_STRUCTURE, project=self, finished=False))
-
-        self.depth_path_geometric = []
-        self.depth_path_photometric = []
 
         for depth_path in list(self._depth_image_path.glob('*.bin')):
             if 'geometric' in depth_path.__str__():
@@ -534,7 +617,7 @@ class COLMAPProject(PhotogrammetrySoftware):
             elif 'photometric' in depth_path.__str__():
                 self.depth_path_photometric.append(depth_path.__str__())
             else:
-                raise ValueError('Unkown depth image type: {}'.format(path))
+                raise ValueError('Unkown depth image type: {}'.format(depth_path))
 
         if self.output_status_function:
             self.output_status_function(
@@ -546,6 +629,10 @@ class COLMAPProject(PhotogrammetrySoftware):
 
         @return:
         """
+        if self._fused_path is None or not self._fused_path.exists():
+            self.dense = None
+            return
+
         if self.output_status_function:
             self.output_status_function(
                 LoadElementStatus(element=LoadElement.DENSE_MODEL, project=self, finished=False))
@@ -556,7 +643,8 @@ class COLMAPProject(PhotogrammetrySoftware):
             self.output_status_function(LoadElementStatus(element=LoadElement.DENSE_MODEL, project=self, finished=True))
 
     def transform_poses(self, T):
-        from colmap_wrapper.colmap import (rotmat2qvec)
+        # from colmap_wrapper.colmap import (rotmat2qvec)
+        from colmap_wrapper.dataloader.utils import (rotmat2qvec)
         for image_idx in self.images.keys():
             self.images[image_idx].extrinsics = T @ self.images[image_idx].extrinsics
             self.images[image_idx].qvec = rotmat2qvec(self.images[image_idx].extrinsics[:3, :3].T.flatten())
@@ -575,18 +663,22 @@ class COLMAPProject(PhotogrammetrySoftware):
 
     def transform(self, T):
         self.transform_poses(T)
-        self.transform_dense(T)
+        if not self.ignore_dense:
+            self.transform_dense(T)
         self.transform_sparse(T)
 
     def save(self):
-        path_pc = os.path.join(self._dense_base_path, 'fused_oriented.ply')
-        o3d.io.write_point_cloud(path_pc, self.dense)
+        if not self.ignore_dense:
+            path_pc = os.path.join(self._dense_base_path, 'fused_oriented.ply')
+            o3d.io.write_point_cloud(path_pc, self.dense)
 
         path_sparse_points = os.path.join(self._sparse_base_path, 'points3D_oriented.bin')
         write_points3D_binary(self.sparse, path_sparse_points)
 
         path_image = os.path.join(self._sparse_base_path, 'images_oriented.bin')
         write_images_binary(self.images, path_image)
+
+        return path_sparse_points, path_image
 
     def save_transform(self, T):
         '''

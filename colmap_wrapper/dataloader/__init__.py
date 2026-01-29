@@ -28,9 +28,11 @@ class COLMAP(object):
         image_resize: float = 1.0,
         bg_color: np.ndarray = np.asarray([1, 1, 1]),
         exif_read=False,
+        ignore_dense: bool = False,
     ):
         self.exif_read = exif_read
         self.vis_bg_color = bg_color
+        self.ignore_dense = ignore_dense
         self._project_path: Path = Path(project_path)
 
         if "~" in str(self._project_path):
@@ -52,7 +54,7 @@ class COLMAP(object):
                     0: {
                         "project_path": self._project_path,
                         "sparse": self._sparse_base_path,
-                        "dense": self._dense_base_path,
+                        "dense": self._dense_base_path if not ignore_dense else None,
                     }
                 }
             )
@@ -64,10 +66,14 @@ class COLMAP(object):
                     {project_index: {"sparse": sparse_project_path}}
                 )
 
-            for project_index, dense_project_path in enumerate(
-                list(self._dense_base_path.iterdir())
-            ):
-                project_structure[project_index].update({"dense": dense_project_path})
+            if not ignore_dense and self._dense_base_path.exists():
+                for project_index, dense_project_path in enumerate(
+                    list(self._dense_base_path.iterdir())
+                ):
+                    project_structure[project_index].update({"dense": dense_project_path})
+            else:
+                for project_index in project_structure.keys():
+                    project_structure[project_index].update({"dense": None})
 
             for project_index in project_structure.keys():
                 project_structure[project_index].update(
@@ -88,6 +94,7 @@ class COLMAP(object):
                 # image_resize=0.4,
                 bg_color=bg_color,
                 exif_read=self.exif_read,
+                ignore_dense=self.ignore_dense,
             )
 
             self.project_list.append(project)
